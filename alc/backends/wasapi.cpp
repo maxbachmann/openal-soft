@@ -1173,16 +1173,18 @@ struct WasapiPlayback final : BackendBase {
         ComPtr<ISpatialAudioObjectRenderStream> mRender{nullptr};
         AudioObjectType mStaticMask{};
     };
+    struct NoDevice { };
 
     void mixerProc(PlainDevice const &audio);
     void mixerProc(SpatialDevice const &audio);
+    void mixerProc(NoDevice const &audio);
 
     auto openProxy(std::string_view name, DeviceHelper const &helper, DeviceHandle &mmdev)
         -> HRESULT;
     void finalizeFormat(WAVEFORMATEXTENSIBLE &OutputType);
     auto initSpatial(DeviceHelper &helper, DeviceHandle &mmdev, SpatialDevice &audio) -> bool;
     auto resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
-        std::variant<PlainDevice,SpatialDevice> &audiodev) -> HRESULT;
+        std::variant<NoDevice,PlainDevice,SpatialDevice> &audiodev) -> HRESULT;
 
     void proc_thread(const std::string &name);
 
@@ -1251,6 +1253,48 @@ WasapiPlayback::~WasapiPlayback()
     if(mNotifyEvent != nullptr)
         CloseHandle(mNotifyEvent);
     mNotifyEvent = nullptr;
+}
+
+FORCE_ALIGN void WasapiPlayback::mixerProc(NoDevice const&)
+{
+    const milliseconds restTime{mDevice->mUpdateSize*1000/mDevice->mSampleRate / 2};
+
+    SetRTPriority();
+    althrd_setname(GetMixerThreadName());
+
+    auto done = 0_i64;
+    auto start = std::chrono::steady_clock::now();
+    while(!mKillNow.load(std::memory_order_acquire)
+        && mDevice->Connected.load(std::memory_order_acquire))
+    {
+        auto now = std::chrono::steady_clock::now();
+
+        /* This converts from nanoseconds to nanosamples, then to samples. */
+        const auto avail = i64{std::chrono::duration_cast<seconds>((now-start)
+            * mDevice->mSampleRate).count()};
+        if(avail-done < mDevice->mUpdateSize)
+        {
+            std::this_thread::sleep_for(restTime);
+            continue;
+        }
+        while(avail-done >= mDevice->mUpdateSize)
+        {
+            mDevice->renderSamples(nullptr, mDevice->mUpdateSize, 0u);
+            done += i64{mDevice->mUpdateSize};
+        }
+
+        /* For every completed second, increment the start time and reduce the
+         * samples done. This prevents the difference between the start time
+         * and current time from growing too large, while maintaining the
+         * correct number of samples to render.
+         */
+        if(done >= mDevice->mSampleRate)
+        {
+            const auto s = seconds{(done/i64{mDevice->mSampleRate}).c_val};
+            start += s;
+            done -= i64{mDevice->mSampleRate*s.count()};
+        }
+    }
 }
 
 
@@ -1545,7 +1589,7 @@ try {
         return;
     }
 
-    auto audiodev = std::variant<PlainDevice,SpatialDevice>{};
+    auto audiodev = std::variant<NoDevice,PlainDevice,SpatialDevice>{};
 
     auto plock = std::unique_lock{mProcMutex};
     mProcResult = S_OK;
@@ -1979,7 +2023,7 @@ auto WasapiPlayback::reset() -> bool
 }
 
 auto WasapiPlayback::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
-    std::variant<PlainDevice,SpatialDevice> &audiodev) -> HRESULT
+    std::variant<NoDevice,PlainDevice,SpatialDevice> &audiodev) -> HRESULT
 {
     if(GetConfigValueBool(mDevice->mDeviceName, "wasapi", "spatial-api", false))
     {
@@ -2349,6 +2393,9 @@ void WasapiPlayback::stop()
 ClockLatency WasapiPlayback::getClockLatency()
 {
     auto dlock = std::lock_guard{mMutex};
+    if(mFormat.Format.nSamplesPerSec == 0)
+        return BackendBase::getClockLatency();
+
     auto ret = ClockLatency{};
     ret.ClockTime = mDevice->getClockTime();
     ret.Latency  = seconds{mPadding.load(std::memory_order_relaxed)};
@@ -2686,6 +2733,13 @@ auto WasapiCapture::openProxy(std::string_view const name, DeviceHelper const &h
     {
         WARN("Failed to open device \"{}\": {:#x}", devname.empty()
             ? "(default)"sv : std::string_view{devname}, as_unsigned(hr));
+        if(name.empty() && hr == E_NOTFOUND)
+        {
+            mmdev = nullptr;
+            mDeviceName = "No Output (WASAPI)";
+            return S_OK;
+        }
+
         return hr;
     }
     if(!devname.empty())
@@ -2699,6 +2753,13 @@ auto WasapiCapture::openProxy(std::string_view const name, DeviceHelper const &h
 auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
     ComPtr<IAudioClient> &client, ComPtr<IAudioCaptureClient> &capture) -> HRESULT
 {
+    if(!mmdev)
+    {
+        audiodev.emplace<NoDevice>();
+        setDefaultWFXChannelOrder();
+        return S_OK;
+    }
+
     capture = nullptr;
     client = nullptr;
 
