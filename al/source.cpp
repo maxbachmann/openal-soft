@@ -3583,9 +3583,19 @@ try {
     {
         const auto Current = std::invoke([source,context]() -> const VoiceBufferItem*
         {
-            if(auto *voice = GetSourceVoice(source, context))
-                return voice->mCurrentBuffer.load(std::memory_order_relaxed);
-            return nullptr;
+            auto const device = al::get_not_null(context->mALDevice);
+            const VoiceBufferItem* Current = nullptr;
+            auto refcount = unsigned{};
+            do {
+                refcount = device->waitForMix();
+                Current = nullptr;
+                if(auto *voice = GetSourceVoice(source, context))
+                    Current = voice->mCurrentBuffer.load(std::memory_order_relaxed);
+
+                std::atomic_thread_fence(std::memory_order_acquire);
+            } while(refcount != device->mMixCount.load(std::memory_order_relaxed));
+
+            return Current;
         });
         const auto qiter = std::ranges::find(source->mQueue, Current,
             [](al::BufferQueueItem const &item) { return &item; });
